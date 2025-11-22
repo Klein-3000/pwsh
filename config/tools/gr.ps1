@@ -14,7 +14,7 @@ function global:gr {
 
     # ========== Handle -version ==========
     if ($PSCmdlet.ParameterSetName -eq 'Version') {
-        Write-Output "gr version 0.0.1"
+        Write-Output "gr version 0.0.2"
         return
     }
 
@@ -45,10 +45,12 @@ function global:gr {
 USAGE:
     gr add -name <name> -path <path/to/repo>
     gr rm  <name>
+    gr rename <old_name> <new_name>
+    gr cd  <name>
     gr list
-    gr log [name]
     gr status [name]
-    gr cd <name>
+    gr log [name]
+    gr run <name> <git_cmd> [age...]
     gr -v | --version
     gr help
 DESCRIPTION:
@@ -283,6 +285,57 @@ DESCRIPTION:
             }
         }
 
+        'run' {
+            if ($RemainingArgs.Count -lt 1) {
+                Write-Error "用法: gr run <仓库名> <git命令> [参数...]"
+                return
+            }
+
+            $repoName = $RemainingArgs[0]
+            $gitArgs  = $RemainingArgs[1..($RemainingArgs.Count - 1)]
+
+            $configFile = "$HOME\.gr"
+            if (-not (Test-Path $configFile)) {
+                Write-Error "错误：尚未配置任何仓库。请先使用 'gr add'。"
+                return
+            }
+
+            $jsonContent = Get-Content $configFile -Raw
+            if ([string]::IsNullOrWhiteSpace($jsonContent)) {
+                Write-Error "错误：配置文件为空。"
+                return
+            }
+
+            try {
+                $repoConfig = $jsonContent | ConvertFrom-Json
+            } catch {
+                Write-Error "错误：无法解析 .gr 配置文件：$($_.Exception.Message)"
+                return
+            }
+
+            $repos = @{}
+            foreach ($prop in $repoConfig.psobject.Properties) {
+                $repos[$prop.Name] = $prop.Value
+            }
+
+            if (-not $repos.ContainsKey($repoName)) {
+                Write-Error "错误：仓库 '$repoName' 未被管理。可用仓库：$($repos.Keys -join ', ')"
+                return
+            }
+
+            $repoPath = $repos[$repoName]
+            if (-not (Test-Path $repoPath)) {
+                Write-Error "错误：仓库路径不存在：$repoPath"
+                return
+            }
+
+            # 执行 git 命令（核心！）
+            & git -C $repoPath @gitArgs
+
+            # 保留退出码（可选但推荐）
+            $global:LASTEXITCODE = $LASTEXITCODE
+        }
+
         'add' {
             if ($RemainingArgs.Count -ne 4) {
                 Write-Error "用法: gr add -name <name> -path <path>"
@@ -344,6 +397,77 @@ DESCRIPTION:
             Save-RepoMap $repos
             Write-Host "[SUCCESS] 已移除管理记录: $name --> $oldPath" -ForegroundColor Green
             Write-Host "(注意：磁盘上的仓库文件未被删除)" -ForegroundColor Gray
+        }
+
+        'rename' {
+            if ($RemainingArgs.Count -ne 2) {
+                Write-Error "用法: gr rename <旧名称> <新名称>"
+                return
+            }
+
+            $oldName = $RemainingArgs[0]
+            $newName = $RemainingArgs[1]
+
+            # 校验名称合法性（不能包含特殊字符）
+            if ($newName -match '[\\/:*?"<>| ]') {
+                Write-Error "仓库名称不能包含 \ / : * ? "" < > | 或空格"
+                return
+            }
+
+            $configFile = "$HOME\.gr"
+            if (-not (Test-Path $configFile)) {
+                Write-Error "尚未添加任何仓库，请先使用 'gr add'"
+                return
+            }
+
+            $jsonContent = Get-Content $configFile -Raw
+            if ([string]::IsNullOrWhiteSpace($jsonContent)) {
+                Write-Error "配置文件为空"
+                return
+            }
+
+            try {
+                $repoConfig = $jsonContent | ConvertFrom-Json
+            } catch {
+                Write-Error "配置文件格式错误：$($_.Exception.Message)"
+                return
+            }
+
+            # 转为哈希表
+            $repos = @{}
+            foreach ($prop in $repoConfig.psobject.Properties) {
+                $repos[$prop.Name] = $prop.Value
+            }
+
+            # 检查旧名称是否存在
+            if (-not $repos.ContainsKey($oldName)) {
+                Write-Error "错误：仓库 '$oldName' 未被管理"
+                return
+            }
+
+            # 检查新名称是否已存在
+            if ($repos.ContainsKey($newName)) {
+                Write-Error "错误：仓库 '$newName' 已存在"
+                return
+            }
+
+            # 执行重命名：移除旧键，添加新键
+            $path = $repos[$oldName]
+            $repos.Remove($oldName)
+            $repos[$newName] = $path
+
+            # 写回 .gr 文件（按字母排序，美观）
+            $sortedRepos = [ordered]@{}
+            foreach ($key in ($repos.Keys | Sort-Object)) {
+                $sortedRepos[$key] = $repos[$key]
+            }
+
+            try {
+                $sortedRepos | ConvertTo-Json -Depth 99 | Set-Content $configFile -Encoding UTF8
+                Write-Host "✓ 仓库名称已从 '$oldName' 改为 '$newName'" -ForegroundColor Green
+            } catch {
+                Write-Error "写入配置文件失败：$($_.Exception.Message)"
+            }
         }
 
         'cd' {
