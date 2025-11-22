@@ -51,6 +51,8 @@ USAGE:
     gr status [name]
     gr log [name]
     gr run <name> <git_cmd> [age...]
+    gr open <name> 
+    gr info <name> 
     gr -v | --version
     gr help
 DESCRIPTION:
@@ -231,7 +233,7 @@ DESCRIPTION:
                 Write-Host ">>> $($repo.Name) --> $($repo.Path)" -ForegroundColor Green
                 Write-Host ("=" * 60) -ForegroundColor Cyan
 
-                $result = & git -C $repo.Path log --oneline --graph --all 2>&1
+                $result = & git -C $repo.Path log --oneline --graph -n 5 2>&1
                 if ($LASTEXITCODE -ne 0) {
                     Write-Host "❌ Git 错误: $($result | Out-String)" -ForegroundColor Red
                 } else {
@@ -294,6 +296,7 @@ DESCRIPTION:
             $repoName = $RemainingArgs[0]
             $gitArgs  = $RemainingArgs[1..($RemainingArgs.Count - 1)]
 
+            # 加载配置（复用你的逻辑）
             $configFile = "$HOME\.gr"
             if (-not (Test-Path $configFile)) {
                 Write-Error "错误：尚未配置任何仓库。请先使用 'gr add'。"
@@ -329,16 +332,59 @@ DESCRIPTION:
                 return
             }
 
-            # 执行 git 命令（核心！）
+            # === 新增：打印头部 ===
+            $headerLine = "=" * 60
+            Write-Host $headerLine -ForegroundColor Gray
+            Write-Host ">>> $repoName --> $repoPath" -ForegroundColor Cyan
+            Write-Host $headerLine -ForegroundColor Gray
+
+            # 执行 git 命令
             & git -C $repoPath @gitArgs
 
-            # 保留退出码（可选但推荐）
+            # 保留退出码
             $global:LASTEXITCODE = $LASTEXITCODE
         }
 
         'add' {
+            # === 新增：支持 gr add . ===
+            if ($RemainingArgs.Count -eq 1 -and $RemainingArgs[0] -eq '.') {
+                $currentDir = (Get-Location).Path
+
+                # 检查是否为 Git 仓库
+                if (-not (Test-Path (Join-Path $currentDir ".git"))) {
+                    Write-Error "错误：当前目录不是 Git 仓库（缺少 .git 目录）"
+                    return
+                }
+
+                # 自动取目录名
+                $name = Split-Path $currentDir -Leaf
+                if ([string]::IsNullOrWhiteSpace($name)) {
+                    Write-Error "错误：无法从路径获取目录名"
+                    return
+                }
+                $fullPath = $currentDir
+
+                # 加载现有配置
+                $repos = Get-RepoMap
+
+                # 检查名称冲突
+                if ($repos.ContainsKey($name)) {
+                    Write-Host "名称 '$name' 已存在：" -ForegroundColor Yellow -NoNewline
+                    Write-Host "$name --> $($repos[$name])" -ForegroundColor Cyan
+                    return
+                }
+
+                # 保存
+                $repos[$name] = $fullPath
+                Save-RepoMap $repos
+                Write-Host "[SUCCESS] 已添加: $name --> $fullPath" -ForegroundColor Green
+                return
+            }
+
+            # === 原有逻辑：gr add -name xxx -path yyy ===
             if ($RemainingArgs.Count -ne 4) {
                 Write-Error "用法: gr add -name <name> -path <path>"
+                Write-Error "   或: gr add . （在 Git 仓库目录中执行）"
                 return
             }
 
@@ -482,6 +528,137 @@ DESCRIPTION:
                 return
             }
             Set-Location -Path $repos[$name]
+        }
+
+        'open' {
+            if ($RemainingArgs.Count -ne 1) {
+                Write-Error "用法: gr open <仓库名>"
+                return
+            }
+
+            $repoName = $RemainingArgs[0]
+            $repos = Get-RepoMap
+
+            if (-not $repos.ContainsKey($repoName)) {
+                $allNames = @($repos.Keys | Sort-Object)
+                if ($allNames.Count -le 6) {
+                    $displayNames = $allNames -join ', '
+                } else {
+                    $displayNames = ($allNames[0..4] -join ', ') + ', ...'
+                }
+                Write-Error @"
+错误：仓库 '$repoName' 未被管理。
+可用仓库（前5个）：$displayNames
+👉 使用 'gr list' 查看简要列表，或 'gr list -showpath' 查看路径详情。
+"@
+                return
+            }
+
+            $repoPath = $repos[$repoName]
+            if (-not (Test-Path $repoPath)) {
+                Write-Error "错误：仓库路径不存在：$repoPath"
+                return
+            }
+
+            Write-Host "正在打开: $repoPath" -ForegroundColor Green
+            Invoke-Item $repoPath
+        }
+
+        'info' {
+            if ($RemainingArgs.Count -ne 1) {
+                Write-Error "用法: gr info <仓库名>"
+                return
+            }
+
+            $repoName = $RemainingArgs[0]
+            $repos = Get-RepoMap
+
+            if (-not $repos.ContainsKey($repoName)) {
+                $allNames = @($repos.Keys | Sort-Object)
+                if ($allNames.Count -le 6) {
+                    $displayNames = $allNames -join ', '
+                } else {
+                    $displayNames = ($allNames[0..4] -join ', ') + ', ...'
+                }
+                Write-Error @"
+错误：仓库 '$repoName' 未被管理。
+可用仓库（前5个）：$displayNames
+👉 使用 'gr list' 查看简要列表，或 'gr list -showpath' 查看路径详情。
+"@
+                return
+            }
+
+            $repoPath = $repos[$repoName]
+            if (-not (Test-Path $repoPath)) {
+                Write-Error "错误：仓库路径不存在：$repoPath"
+                return
+            }
+
+            # === 显示详细信息 ===
+            $headerLine = "=" * 60
+            Write-Host $headerLine -ForegroundColor Gray
+            Write-Host ">>> $repoName" -ForegroundColor Cyan
+            Write-Host $headerLine -ForegroundColor Gray
+
+            Write-Host "路径        : $repoPath"
+
+            if (-not (Test-Path (Join-Path $repoPath ".git"))) {
+                Write-Host "状态        : ❌ 不是 Git 仓库" -ForegroundColor Red
+                return
+            }
+
+            # 当前分支
+            $branch = & git -C $repoPath rev-parse --abbrev-ref HEAD 2>$null
+            if ($LASTEXITCODE -ne 0) { $branch = "<unknown>" }
+
+            # 远程跟踪分支
+            $tracking = & git -C $repoPath for-each-ref --format='%(upstream:short)' refs/heads/$branch 2>$null
+            if ($tracking) {
+                $branchDisplay = "$branch (跟踪 $tracking)"
+            } else {
+                $branchDisplay = "$branch (无远程跟踪)"
+            }
+            Write-Host "分支        : $branchDisplay"
+
+            # 远程 URL
+            $remoteUrl = & git -C $repoPath remote get-url origin 2>$null
+            if (-not $remoteUrl) { $remoteUrl = "<未设置 origin>" }
+            Write-Host "远程 URL    : $remoteUrl"
+
+            # 工作区状态
+            $statusPorcelain = & git -C $repoPath status --porcelain 2>$null
+            if ($null -eq $statusPorcelain -or $statusPorcelain.Count -eq 0) {
+                $statusText = "干净"
+                $statusColor = "Green"
+            } else {
+                $modified = @($statusPorcelain | Where-Object { $_.StartsWith('M') }).Count
+                $untracked = @($statusPorcelain | Where-Object { $_.StartsWith('?') }).Count
+                $deleted = @($statusPorcelain | Where-Object { $_.StartsWith('D') }).Count
+
+                $parts = @()
+                if ($modified -gt 0) { $parts += "${modified}个修改" }
+                if ($untracked -gt 0) { $parts += "${untracked}个未跟踪" }
+                if ($deleted -gt 0) { $parts += "${deleted}个删除" }
+                $statusText = "有变更 (" + ($parts -join ", ") + ")"
+                $statusColor = "Yellow"
+            }
+            Write-Host "状态        : $statusText" -ForegroundColor $statusColor
+
+            # 最新提交
+            $logLine = & git -C $repoPath log -1 --pretty=format:"%h|%ad|%an <%ae>|%s" --date=iso 2>$null
+            if ($logLine) {
+                $parts = $logLine -split '\|', 4
+                $commitHash = $parts[0]
+                $commitDate = $parts[1].Substring(0, 19) -replace 'T', ' '
+                $author     = $parts[2]
+                $subject    = $parts[3]
+
+                Write-Host "最新提交    : $commitHash ($commitDate)"
+                Write-Host "作者        : $author"
+                Write-Host "提交消息    : $subject"
+            } else {
+                Write-Host "最新提交    : <无提交记录>"
+            }
         }
 
         default {
