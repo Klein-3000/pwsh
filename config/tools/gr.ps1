@@ -1,26 +1,30 @@
 function global:gr {
+    [CmdletBinding(DefaultParameterSetName = 'Command')]
     param(
-        [Parameter(Position = 0)]
+        [Parameter(Position = 0, ParameterSetName = 'Command')]
         [string]$Command,
 
-        [Parameter(ValueFromRemainingArguments = $true)]
+        [Parameter(ParameterSetName = 'Version')]
+        [Alias('v')]
+        [switch]$Version,
+
+        [Parameter(ValueFromRemainingArguments = $true, ParameterSetName = 'Command')]
         [string[]]$RemainingArgs
     )
 
-    # ========== 特殊处理：顶层 -v / --version ==========
-    if ($Command -and ($Command -eq '-v' -or $Command -eq '--version' -or $Command -eq '-version')) {
-        Write-Host "gr v0.0.1"
+    # ========== Handle -version ==========
+    if ($PSCmdlet.ParameterSetName -eq 'Version') {
+        Write-Output "gr version 0.0.1"
         return
     }
 
-    # ========== 缺少子命令 ==========
+    # ========== Missing command ==========
     if ([string]::IsNullOrWhiteSpace($Command)) {
         Write-Error "缺少子命令。使用 'gr help' 查看帮助。"
         return
     }
 
     $configPath = "$HOME/.gr"
-
     if (-not (Test-Path $configPath)) {
         @{} | ConvertTo-Json -Depth 10 | Set-Content $configPath -Encoding Utf8
     }
@@ -40,9 +44,10 @@ function global:gr {
             Write-Host @"
 USAGE:
     gr add -name <name> -path <path/to/repo>
-    gr rm -name <name>
+    gr rm  <name>
     gr list
-    gr list -verbose   (or -v)
+    gr log [name]
+    gr status [name]
     gr cd <name>
     gr -v | --version
     gr help
@@ -52,16 +57,98 @@ DESCRIPTION:
         }
 
         'list' {
-            # ✅ 不管有没有参数，一律输出完整路径格式
+            $repos = Get-RepoMap
+            if ($repos.Count -eq 0) {
+                Write-Host "暂无管理的仓库。" -ForegroundColor Gray
+                return
+            }
+            $sortedNames = $repos.Keys | Sort-Object
+            foreach ($name in $sortedNames) {
+                Write-Host "$name --> $($repos[$name])"
+            }
+        }
+
+        'log' {
             $repos = Get-RepoMap
             if ($repos.Count -eq 0) {
                 Write-Host "暂无管理的仓库。" -ForegroundColor Gray
                 return
             }
 
-            $sortedNames = $repos.Keys | Sort-Object
-            foreach ($name in $sortedNames) {
-                Write-Host "$name --> $($repos[$name])"
+            if ($RemainingArgs.Count -gt 1) {
+                Write-Error "用法: gr log [name]"
+                return
+            }
+
+            $targets = if ($RemainingArgs.Count -eq 1) {
+                $name = $RemainingArgs[0]
+                if (-not $repos.ContainsKey($name)) {
+                    Write-Error "仓库 '$name' 未注册"
+                    return
+                }
+                @(@{ Name = $name; Path = $repos[$name] })
+            } else {
+                foreach ($key in ($repos.Keys | Sort-Object)) {
+                    @{ Name = $key; Path = $repos[$key] }
+                }
+            }
+
+            foreach ($repo in $targets) {
+                Write-Host ("=" * 60) -ForegroundColor Cyan
+                Write-Host ">>> $($repo.Name) --> $($repo.Path)" -ForegroundColor Green
+                Write-Host ("=" * 60) -ForegroundColor Cyan
+
+                $result = & git -C $repo.Path log --oneline --graph --all 2>&1
+                if ($LASTEXITCODE -ne 0) {
+                    Write-Host "❌ Git 错误: $($result | Out-String)" -ForegroundColor Red
+                } else {
+                    $result
+                }
+                Write-Host ""
+            }
+        }
+
+        'status' {
+            $repos = Get-RepoMap
+            if ($repos.Count -eq 0) {
+                Write-Host "暂无管理的仓库。" -ForegroundColor Gray
+                return
+            }
+
+            if ($RemainingArgs.Count -gt 1) {
+                Write-Error "用法: gr status [name]"
+                return
+            }
+
+            $targets = if ($RemainingArgs.Count -eq 1) {
+                $name = $RemainingArgs[0]
+                if (-not $repos.ContainsKey($name)) {
+                    Write-Error "仓库 '$name' 未注册"
+                    return
+                }
+                @(@{ Name = $name; Path = $repos[$name] })
+            } else {
+                foreach ($key in ($repos.Keys | Sort-Object)) {
+                    @{ Name = $key; Path = $repos[$key] }
+                }
+            }
+
+            foreach ($repo in $targets) {
+                Write-Host ("=" * 50) -ForegroundColor Yellow
+                Write-Host ">>> $($repo.Name)" -ForegroundColor Magenta
+                Write-Host ("=" * 50) -ForegroundColor Yellow
+
+                $result = & git -C $repo.Path status --short 2>&1
+                if ($LASTEXITCODE -ne 0) {
+                    Write-Host "❌ Git 错误: $($result | Out-String)" -ForegroundColor Red
+                } else {
+                    if ([string]::IsNullOrWhiteSpace(($result | Out-String).Trim())) {
+                        Write-Host "  (干净)" -ForegroundColor Green
+                    } else {
+                        $result
+                    }
+                }
+                Write-Host ""
             }
         }
 
@@ -71,21 +158,14 @@ DESCRIPTION:
                 return
             }
 
-            # 手动配对参数（允许顺序任意）
             $name = $null
             $path = $null
-
             for ($i = 0; $i -lt $RemainingArgs.Count; $i += 2) {
                 $key = $RemainingArgs[$i]
                 $value = $RemainingArgs[$i + 1]
-                if ($key -eq '-name') {
-                    $name = $value
-                } elseif ($key -eq '-path') {
-                    $path = $value
-                } else {
-                    Write-Error "未知参数: '$key'"
-                    return
-                }
+                if ($key -eq '-name') { $name = $value }
+                elseif ($key -eq '-path') { $path = $value }
+                else { Write-Error "未知参数: '$key'"; return }
             }
 
             if (-not $name -or -not $path) {
@@ -118,20 +198,21 @@ DESCRIPTION:
         }
 
         'rm' {
-            if ($RemainingArgs.Count -ne 2 -or $RemainingArgs[0] -ne '-name') {
-                Write-Error "用法: gr rm -name <name>"
+            if ($RemainingArgs.Count -ne 1) {
+                Write-Error "用法: gr rm <name>"
                 return
             }
-            $name = $RemainingArgs[1]
+            $name = $RemainingArgs[0]
             $repos = Get-RepoMap
             if (-not $repos.ContainsKey($name)) {
-                Write-Error "未找到仓库: $name"
+                Write-Error "未找到仓库: '$name'"
                 return
             }
             $oldPath = $repos[$name]
             $repos.Remove($name)
             Save-RepoMap $repos
-            Write-Host "[SUCCESS] 已移除: $name --> $oldPath" -ForegroundColor Green
+            Write-Host "[SUCCESS] 已移除管理记录: $name --> $oldPath" -ForegroundColor Green
+            Write-Host "(注意：磁盘上的仓库文件未被删除)" -ForegroundColor Gray
         }
 
         'cd' {
