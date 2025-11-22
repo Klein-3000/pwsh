@@ -57,14 +57,145 @@ DESCRIPTION:
         }
 
         'list' {
-            $repos = Get-RepoMap
-            if ($repos.Count -eq 0) {
+            # === 参数解析：检查是否包含 -ShowPath ===
+            $showPath = $false
+            if ($RemainingArgs.Count -eq 1 -and $RemainingArgs[0] -eq '-ShowPath') {
+                $showPath = $true
+            } elseif ($RemainingArgs.Count -gt 0) {
+                Write-Error "用法: gr list [-ShowPath]"
+                return
+            }
+
+            $configFile = "$HOME\.gr"
+            if (-not (Test-Path -Path $configFile)) {
                 Write-Host "暂无管理的仓库。" -ForegroundColor Gray
                 return
             }
-            $sortedNames = $repos.Keys | Sort-Object
-            foreach ($name in $sortedNames) {
-                Write-Host "$name --> $($repos[$name])"
+
+            $jsonContent = Get-Content -Path $configFile -Raw
+            if ([string]::IsNullOrWhiteSpace($jsonContent)) {
+                Write-Host "配置文件为空。" -ForegroundColor Yellow
+                return
+            }
+
+            try {
+                $repoConfig = $jsonContent | ConvertFrom-Json
+            } catch {
+                Write-Error "无法解析 .gr 配置文件：$($_.Exception.Message)"
+                return
+            }
+
+            $registeredRepos = @{}
+            if ($null -ne $repoConfig) {
+                foreach ($prop in $repoConfig.psobject.Properties) {
+                    $registeredRepos[$prop.Name] = $prop.Value
+                }
+            }
+
+            if ($registeredRepos.Count -eq 0) {
+                Write-Host "暂无管理的仓库。" -ForegroundColor Gray
+                return
+            }
+
+            # ========== 模式 1: 显示路径映射 ==========
+            if ($showPath) {
+                foreach ($repoName in ($registeredRepos.Keys | Sort-Object)) {
+                    $displayPath = $registeredRepos[$repoName] -replace [regex]::Escape($HOME), '~'
+                    Write-Host "$repoName --> $displayPath"
+                }
+                return
+            }
+
+            # ========== 模式 2: 增强状态列表 ==========
+            $repoStatusList = foreach ($repoName in ($registeredRepos.Keys | Sort-Object)) {
+                $fullPath = $registeredRepos[$repoName]
+
+                if (-not (Test-Path -Path $fullPath)) {
+                    [PSCustomObject]@{
+                        Name       = $repoName
+                        Branch     = "[无效路径]"
+                        StatusIcon = "✗"
+                        LatestLog  = ""
+                        StatusType = 'error'
+                    }
+                    continue
+                }
+
+                $branchResult = & git -C $fullPath rev-parse --abbrev-ref HEAD 2>$null
+                if ($LASTEXITCODE -ne 0) {
+                    [PSCustomObject]@{
+                        Name       = $repoName
+                        Branch     = "[非Git目录]"
+                        StatusIcon = "✗"
+                        LatestLog  = ""
+                        StatusType = 'error'
+                    }
+                    continue
+                }
+
+                $statusOutput = & git -C $fullPath status --porcelain 2>$null
+                $statusType = 'clean'
+                $statusIcon = "✔"
+
+                if ($LASTEXITCODE -ne 0) {
+                    $statusType = 'error'
+                    $statusIcon = "✗"
+                } else {
+                    if ($statusOutput.Count -eq 0) {
+                        $statusType = 'clean'
+                        $statusIcon = "✔"
+                    } elseif ($statusOutput -match '^[\? ]') {
+                        $statusType = 'untracked'
+                        $statusIcon = "?"
+                    } else {
+                        $statusType = 'modified'
+                        $statusIcon = "●"
+                    }
+                }
+
+                $logLine = & git -C $fullPath log -1 --oneline --no-color 2>$null
+                if ($LASTEXITCODE -ne 0 -or -not $logLine) {
+                    $logLine = "<无提交>"
+                }
+
+                [PSCustomObject]@{
+                    Name       = $repoName
+                    Branch     = $branchResult.Trim()
+                    StatusIcon = $statusIcon
+                    LatestLog  = $logLine.Trim()
+                    StatusType = $statusType
+                }
+            }
+
+            $maxNameLen   = [Math]::Max(($repoStatusList.Name | Measure-Object -Property Length -Maximum).Maximum, 4)
+            $maxBranchLen = [Math]::Max(($repoStatusList.Branch | Measure-Object -Property Length -Maximum).Maximum, 6)
+            $maxLogLen    = 50
+
+            foreach ($item in $repoStatusList) {
+                $truncatedLog = if ($item.LatestLog.Length -gt $maxLogLen) {
+                    $item.LatestLog.Substring(0, $maxLogLen - 3) + "..."
+                } else {
+                    $item.LatestLog
+                }
+
+                $namePart   = "{0,-$maxNameLen}" -f $item.Name
+                $branchPart = "{0,-$maxBranchLen}" -f $item.Branch
+                $logPart    = "{0,-$maxLogLen}" -f $truncatedLog
+
+                $color = switch ($item.StatusType) {
+                    'clean'      { 'Green' }
+                    'modified'   { 'Yellow' }
+                    'untracked'  { 'Magenta' }
+                    default      { 'Red' }
+                }
+
+                Write-Host $namePart     -ForegroundColor White       -NoNewline
+                Write-Host "  "          -NoNewline
+                Write-Host $branchPart   -ForegroundColor Cyan        -NoNewline
+                Write-Host " "           -NoNewline
+                Write-Host $item.StatusIcon -ForegroundColor $color   -NoNewline
+                Write-Host "  "          -NoNewline
+                Write-Host $logPart      -ForegroundColor DarkGray
             }
         }
 
