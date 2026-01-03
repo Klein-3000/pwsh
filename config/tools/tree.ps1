@@ -1,7 +1,7 @@
 function global:tree {
     [CmdletBinding()]
     param(
-        [Parameter(Position=0)]
+        [Parameter(Position = 0)]
         [string]$Path = ".",
 
         [int]$L = [int]::MaxValue,
@@ -12,19 +12,23 @@ function global:tree {
 
         [bool]$IsLast = $true,
 
-        [switch]$c,  # 显示统计信息 (dir:x; file:y)
+        [switch]$c,           # 显示统计信息 (dir:x; file:y)
 
-        [switch]$h    # 显示帮助
+        [switch]$h,           # 显示帮助
+
+        [string[]]$i,         # 忽略模式（通配符），如 "f*", "*.log"
+
+        [switch]$NoIgnore     # 不读取 ~/.tree 配置
     )
 
     if ($h) {
-        Write-Host "`ntree v1.0 - 以树状结构显示目录内容`n" -ForegroundColor Cyan
+        Write-Host "`ntree v1.2 - 以树状结构显示目录内容（支持 ~/.tree 配置）`n" -ForegroundColor Cyan
 
         Write-Host "用法:" -ForegroundColor Yellow
-        Write-Host "    tree [-Path <string>] [-L <int>] [-c] [-h]`n"
+        Write-Host "    tree [-Path <string>] [-L <int>] [-c] [-i <pattern>...] [-NoIgnore] [-h]`n"
 
         Write-Host "参数:" -ForegroundColor Yellow
-        Write-Host "    -Path <string)        " -NoNewline -ForegroundColor White
+        Write-Host "    -Path <string>        " -NoNewline -ForegroundColor White
         Write-Host "要显示的路径（默认: 当前目录）"
 
         Write-Host "    -L <int>              " -NoNewline -ForegroundColor White
@@ -33,87 +37,83 @@ function global:tree {
         Write-Host "    -c                    " -NoNewline -ForegroundColor White
         Write-Host "显示每个目录的统计信息 (dir:x; file:y)"
 
+        Write-Host "    -i <pattern>          " -NoNewline -ForegroundColor White
+        Write-Host "忽略匹配名称的项（支持 * 通配符，多个用逗号分隔）"
+
+        Write-Host "    -NoIgnore             " -NoNewline -ForegroundColor White
+        Write-Host "忽略 ~/.tree 配置文件（仅使用命令行 -i）"
+
         Write-Host "    -h, --help            " -NoNewline -ForegroundColor White
         Write-Host "显示此帮助信息并退出`n"
 
+        Write-Host "配置文件:" -ForegroundColor Yellow
+        Write-Host "    ~/.tree               每行一个忽略模式（支持 *），以 # 开头为注释`n"
+
         Write-Host "示例:" -ForegroundColor Yellow
-        Write-Host "    tree                  # 显示当前目录树"
-        Write-Host "    tree -L 2             # 只显示两层深度"
-        Write-Host "    tree -c               # 显示统计信息"
-        Write-Host "    tree 'C:\Temp' -L 3   # 指定路径，深度3`n"
-
-        return
-    }
-    # ✅ 互斥检查
-    if ($d -and $f) {
-        Write-Warning "参数 -d 和 -f 不能同时使用。请只选择其中一个，或都不使用以显示全部内容。"
-        Write-Host "用法示例:" -ForegroundColor Yellow
-        Write-Host "    save -d           # 仅显示目录"
-        Write-Host "    save -f           # 仅显示文件"
-        Write-Host "    save              # 显示所有" -ForegroundColor Gray
+        Write-Host "    tree                                  # 使用 ~/.tree + 默认行为"
+        Write-Host "    tree -i 'build*','*.tmp'              # 合并 ~/.tree 和命令行忽略"
+        Write-Host "    tree -NoIgnore                        # 完全忽略 ~/.tree"
+        Write-Host "    tree -NoIgnore -i 'temp*'             # 仅使用命令行忽略"
         return
     }
 
+    # === 构建最终忽略列表 ===
+    $EffectiveIgnore = @()
+
+    # 1. 从 ~/.tree 读取（除非 -NoIgnore）
+    if (-not $NoIgnore) {
+        $ConfigPath = Join-Path $HOME ".tree"
+        if (Test-Path -Path $ConfigPath -PathType Leaf) {
+            try {
+                $ConfigLines = Get-Content $ConfigPath -ErrorAction Stop |
+                    ForEach-Object { $_.Trim() } |
+                    Where-Object {
+                        $_ -ne "" -and -not $_.StartsWith("#")
+                    }
+                $EffectiveIgnore += $ConfigLines
+            }
+            catch {
+                # 静默忽略读取错误（权限、编码等）
+            }
+        }
+    }
+
+    # 2. 合并命令行 -i（优先级更高，但实际匹配时顺序无关）
+    if ($i) {
+        $EffectiveIgnore += $i
+    }
+
+    # 去重（可选，非必须，但更干净）
+    $EffectiveIgnore = $EffectiveIgnore | Sort-Object -Unique
+
+    # 固定排除项（硬编码，始终生效，即使 -NoIgnore）
+    $FixedExcludes = @('.git', '.svn', '.hg', 'node_modules', '__pycache__', 'Thumbs.db', 'desktop.ini')
+
+    # 获取当前项
     $Item = Get-Item $Path -ErrorAction SilentlyContinue
-    if (!$Item) { 
-        return  # 路径无效，静默跳过
+    if (-not $Item) {
+        return
     }
 
-    $Name = $Item.Name
-
-    # 🔽 固定排除的系统/元数据目录（不包括 .gitignore 等文件）
-    $ExcludedDirs = @('.git', '.svn', '.hg', 'node_modules', '__pycache__', 'Thumbs.db', 'desktop.ini')
-
-    # 如果是被排除的目录，且不是根节点，则跳过
-    if ($Item.PSIsContainer -and ($ExcludedDirs -contains $Name)) {
-        if ($CurrentLevel -gt 0) {
-            return  # 不显示，也不展开
-        }
-        # 根节点是 .git？不可能，但安全起见也跳过
-        if ($ExcludedDirs -contains $Name) {
-            Write-Warning "无法显示受保护目录: $Path"
-            return
-        }
+    # 非根节点且是固定排除项 → 跳过
+    if ($CurrentLevel -gt 0 -and $Item.PSIsContainer -and ($FixedExcludes -contains $Item.Name)) {
+        return
     }
 
     # ========== 显示当前节点 ==========
-    if ($CurrentLevel -gt 0) {
-        $stats = ""
-        if ($c -and $Item.PSIsContainer) {
-            # 获取子项，并排除特殊目录
-            $children = @(
-                Get-ChildItem $Path -Force -ErrorAction SilentlyContinue |
-                Where-Object { $_.PSIsContainer -or (-not $_.PSIsContainer -and $_.Name -notin $ExcludedDirs) } |
-                Where-Object { $_.Name -notin $ExcludedDirs }
-            )
-            $dirs = @($children | Where-Object { $_.PSIsContainer }).Count
-            $files = @($children | Where-Object { -not $_.PSIsContainer }).Count
-            $stats = " (dir:$dirs; file:$files)"
-        }
-
-        $connector = if ($IsLast) { '└── ' } else { '├── ' }
-        $color = if ($Item.PSIsContainer) { 'DarkCyan' } else { 'White' }
-
-        Write-Host "$Prefix$connector$Name" -NoNewline -ForegroundColor $color
-        if ($stats) {
-            Write-Host "$stats" -ForegroundColor Green
-        } else {
-            Write-Host ""
-        }
-    }
-    else {
-        # 根节点
+    if ($CurrentLevel -eq 0) {
         $rootStats = ""
         if ($c) {
-            $children = @(
-                Get-ChildItem $Path -Force -ErrorAction SilentlyContinue |
-                Where-Object { $_.Name -notin $ExcludedDirs }
-            )
-            $dirs = @($children | Where-Object { $_.PSIsContainer }).Count
-            $files = @($children | Where-Object { -not $_.PSIsContainer }).Count
+            $allChildren = Get-ChildItem $Path -Force -ErrorAction SilentlyContinue
+            $filtered = @($allChildren | Where-Object {
+                $name = $_.Name
+                ($name -notin $FixedExcludes) -and
+                (@($EffectiveIgnore | Where-Object { $name -like $_ }).Count -eq 0)
+            })
+            $dirs  = @($filtered | Where-Object PSIsContainer).Count
+            $files = @($filtered | Where-Object { -not $_.PSIsContainer }).Count
             $rootStats = " (dir:$dirs; file:$files)"
         }
-
         Write-Host $Item.FullName -NoNewline
         if ($rootStats) {
             Write-Host "$rootStats" -ForegroundColor Green
@@ -121,27 +121,53 @@ function global:tree {
             Write-Host ""
         }
     }
+    else {
+        $connector = if ($IsLast) { '└── ' } else { '├── ' }
+        $color = if ($Item.PSIsContainer) { 'DarkCyan' } else { 'White' }
 
-    # 如果不是目录或已达到最大深度，停止
-    if (!$Item.PSIsContainer -or $CurrentLevel -ge $L) {
+        $stats = ""
+        if ($c -and $Item.PSIsContainer) {
+            $allChildren = Get-ChildItem $Path -Force -ErrorAction SilentlyContinue
+            $filtered = @($allChildren | Where-Object {
+                $name = $_.Name
+                ($name -notin $FixedExcludes) -and
+                (@($EffectiveIgnore | Where-Object { $name -like $_ }).Count -eq 0)
+            })
+            $dirs  = @($filtered | Where-Object PSIsContainer).Count
+            $files = @($filtered | Where-Object { -not $_.PSIsContainer }).Count
+            $stats = " (dir:$dirs; file:$files)"
+        }
+
+        Write-Host "$Prefix$connector$($Item.Name)" -NoNewline -ForegroundColor $color
+        if ($stats) {
+            Write-Host "$stats" -ForegroundColor Green
+        } else {
+            Write-Host ""
+        }
+    }
+
+    # 停止条件
+    if (-not $Item.PSIsContainer -or $CurrentLevel -ge $L) {
         return
     }
 
-    # 获取子项（排除特殊目录）
-    $Children = @(
-        Get-ChildItem $Path -Force -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -notin $ExcludedDirs } |
-        Sort-Object Name
-    )
+    # 获取子项：应用固定排除 + 有效忽略规则
+    $Children = @(Get-ChildItem $Path -Force -ErrorAction SilentlyContinue |
+        Where-Object {
+            $name = $_.Name
+            ($name -notin $FixedExcludes) -and
+            (@($EffectiveIgnore | Where-Object { $name -like $_ }).Count -eq 0)
+        } |
+        Sort-Object Name)
+
     $Total = $Children.Count
 
-    for ($i = 0; $i -lt $Total; $i++) {
-        $Child = $Children[$i]
-        $IsLastChild = ($i -eq ($Total - 1))
+    for ($idx = 0; $idx -lt $Total; $idx++) {
+        $Child = $Children[$idx]
+        $IsLastChild = ($idx -eq ($Total - 1))
+        $NewPrefix = if ($IsLast) { "$Prefix    " } else { "$Prefix│   " }
 
-        $NewPrefix = $IsLast ? "$Prefix    " : "$Prefix│   "
-
-        # 递归调用（不再传 -f）
-        tree -Path $Child.FullName -L $L -CurrentLevel ($CurrentLevel + 1) -Prefix $NewPrefix -IsLast $IsLastChild -c:$c
+        # 递归调用（传递所有参数，包括 -NoIgnore 和 -i）
+        tree -Path $Child.FullName -L $L -CurrentLevel ($CurrentLevel + 1) -Prefix $NewPrefix -IsLast $IsLastChild -c:$c -i $i -NoIgnore:$NoIgnore
     }
 }
