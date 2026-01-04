@@ -1,433 +1,673 @@
-$env:bcm_home = "E:\BongoCatMver"
-
 function global:bcm {
-    [CmdletBinding()]
     param(
-        [Parameter(Position = 0, Mandatory = $true)]
-        [ValidateSet('list', 'up', 'down', 'switch', 'show', 'run', 'help', 'status', 'doctor', 'version')]
+        [Parameter(Mandatory=$true)]
+        [ValidateSet('list', 'up', 'down', 'switch', 'show', 'run', 'stop', 'status', 'check', 'doctor', 'info', 'preview', 'build', 'help', 'version')]
         [string]$Command,
 
-        [Parameter(ValueFromRemainingArguments = $true)]
-        [string[]]$RemainingArgs
+        [Parameter(ValueFromRemainingArguments=$true)]
+        [string[]]$Rest
     )
 
-    # 检查环境变量
+    # === 全局路径配置 ===
     if (-not $env:bcm_home) {
-        Write-Error "Environment variable `$env:bcm_home is not set. Please set it to the root of BongoCatMver (e.g., 'E:\BongoCatMver')."
+        Write-Host "❌ `$env:bcm_home is not set." -ForegroundColor Red
+        Write-Host "💡 Set it to your BongoCatMver root folder (e.g., 'E:\BongoCatMver')" -ForegroundColor DarkGray
         return
     }
 
-    $root = Resolve-Path $env:bcm_home -ErrorAction Stop
-    $appDir = Join-Path $root "BongoCatMver"
-    $sourcesDir = Join-Path $root "Sources"
-
-    if (-not (Test-Path $appDir -PathType Container)) {
-        Write-Error "Application directory not found: $appDir"
-        return
-    }
-    if (-not (Test-Path $sourcesDir -PathType Container)) {
-        Write-Error "Sources directory not found: $sourcesDir"
+    $root = Resolve-Path $env:bcm_home -ErrorAction SilentlyContinue
+    if (-not $root -or -not (Test-Path $root)) {
+        Write-Host "❌ Invalid `$env:bcm_home: $($env:bcm_home)" -ForegroundColor Red
         return
     }
 
-    # 辅助函数：从链接反推当前皮肤名
-    function Get-SkinFromLinks {
-        $configLink = Join-Path $appDir "config.json"
-        if (Test-Path $configLink -PathType Leaf) {
-            $item = Get-Item $configLink -ErrorAction SilentlyContinue
-            if ($item -and $item.LinkType -eq "SymbolicLink") {
-                $target = $item.Target
-                if ($target -and (Test-Path $target)) {
-                    $skinDir = Split-Path (Split-Path $target -Parent) -Leaf
-                    if (Test-Path (Join-Path $sourcesDir $skinDir)) {
-                        return $skinDir
-                    }
-                }
-            }
+    $appDir      = Join-Path $root "BongoCatMver"
+    $sourcesDir  = Join-Path $root "Sources"
+    $recordFile  = Join-Path $appDir ".bcm-skin"
+
+    # === 辅助函数 ===
+    function Get-CurrentSkin {
+        if (Test-Path $recordFile) {
+            return (Get-Content $recordFile -Raw).Trim()
         }
         return $null
     }
 
-    # 辅助函数：获取当前激活的皮肤名（优先读记录，其次尝试恢复）
-    function Get-CurrentSkin {
-        $recordFile = Join-Path $appDir ".bcm-skin"
-        if (Test-Path $recordFile) {
-            return Get-Content $recordFile -Raw
-        } else {
-            return Get-SkinFromLinks
-        }
-    }
+    function Get-SkinFromLinks {
+        $imgTarget = $null
+        $configTarget = $null
 
-    # 辅助函数：清理当前激活状态（供 down 使用）
-    function Remove-CurrentSkin {
-        $imgTarget = Join-Path $appDir "img"
-        $configTarget = Join-Path $appDir "config.json"
-        $recordFile = Join-Path $appDir ".bcm-skin"
-
-        # 删除 img（Junction 或目录）
-        if (Test-Path $imgTarget) {
-            $item = Get-Item $imgTarget
-            if ($item.LinkType -eq "Junction" -or $item.LinkType -eq "SymbolicLink") {
-                Remove-Item $imgTarget -Force
-            } else {
-                Remove-Item $imgTarget -Recurse -Force
+        $imgPath = Join-Path $appDir "img"
+        if (Test-Path $imgPath) {
+            $item = Get-Item $imgPath -ErrorAction SilentlyContinue
+            if ($item -and $item.Target) {
+                $imgTarget = Split-Path $item.Target -Leaf
             }
         }
 
-        # 删除 config.json（SymbolicLink 或文件）
-        if (Test-Path $configTarget) {
-            $item = Get-Item $configTarget -ErrorAction SilentlyContinue
-            if ($item -and $item.LinkType -eq "SymbolicLink") {
-                Remove-Item $configTarget -Force
-            } else {
-                Remove-Item $configTarget -Force
+        $configPath = Join-Path $appDir "config.json"
+        if (Test-Path $configPath) {
+            $item = Get-Item $configPath -ErrorAction SilentlyContinue
+            if ($item -and $item.Target) {
+                $configTarget = Split-Path (Split-Path $item.Target -Parent) -Leaf
             }
         }
 
-        # 删除记录文件
-        if (Test-Path $recordFile) {
-            Remove-Item $recordFile -Force
+        if ($imgTarget -and $imgTarget -eq $configTarget) {
+            return $imgTarget
         }
+        return $null
     }
 
-    switch ($Command) {
-'help' {
-    Write-Host @"
-BongoCat Mver Skin Manager (bcm) - v1.0.0
+# === 内部函数：获取窗口信息（基于你提供的逻辑，去 global 化）===
+function Get-BcmWindowInfo {
+    param([int]$ProcessId)
 
-USAGE:
-  bcm <command> [args]
+    if (-not ('WindowUtils.WindowHelper' -as [type])) {
+        Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
 
-COMMANDS:
-  list                List all available skins in Sources/
-  up <skin>           Activate a skin by creating symlinks
-  down                Deactivate current skin (remove links & record)
-  switch <skin>       Switch to another skin (down + up)
-  show                Show currently active skin name
-  run                 Launch BongoCat Mver (requires active skin)
-  status              Show detailed activation status and health check
-  doctor              Check environment setup and diagnose issues
-  help                Show this help message
-  version             Show version info
+namespace WindowUtils {
+    public class WindowHelper {
+        [DllImport("user32.dll")]
+        public static extern IntPtr FindWindowEx(IntPtr parent, IntPtr child, string className, string windowTitle);
 
-EXAMPLES:
-  bcm list
-  bcm up yuexia-WeddingDress
-  bcm switch yeshunguang
-  bcm status
-  bcm run
-"@ -ForegroundColor Cyan
+        [DllImport("user32.dll")]
+        public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool IsWindowVisible(IntPtr hWnd);
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct RECT {
+            public int Left;
+            public int Top;
+            public int Right;
+            public int Bottom;
+        }
+
+        public static RECT? GetWindowRectByProcessId(int pid) {
+            IntPtr hwnd = IntPtr.Zero;
+            while ((hwnd = FindWindowEx(IntPtr.Zero, hwnd, null, null)) != IntPtr.Zero) {
+                uint processId;
+                GetWindowThreadProcessId(hwnd, out processId);
+                if (processId == pid && IsWindowVisible(hwnd)) {
+                    RECT rect;
+                    if (GetWindowRect(hwnd, out rect)) {
+                        return rect;
+                    }
+                }
+            }
+            return null;
+        }
+    }
 }
+"@
+    }
 
-        'version' {
-            Write-Host "bcm v1.0.0"
+    $rect = [WindowUtils.WindowHelper]::GetWindowRectByProcessId($ProcessId)
+    if ($rect) {
+        $width  = $rect.Right - $rect.Left
+        $height = $rect.Bottom - $rect.Top
+        [PSCustomObject]@{
+            PID    = $ProcessId
+            Left   = $rect.Left
+            Top    = $rect.Top
+            Width  = $width
+            Height = $height
         }
-
+    }
+}
+    # === 主命令分发 ===
+    switch ($Command) {
         'list' {
-            Get-ChildItem $sourcesDir -Directory | ForEach-Object {
-                $skinName = $_.Name
+            if (-not (Test-Path $sourcesDir)) {
+                Write-Host "❌ Sources directory not found: $sourcesDir" -ForegroundColor Red
+                return
+            }
+            $skins = Get-ChildItem $sourcesDir -Directory | ForEach-Object {
+                $name = $_.Name
                 $hasImg = Test-Path (Join-Path $_.FullName "img") -PathType Container
                 $hasConfig = Test-Path (Join-Path $_.FullName "config.json") -PathType Leaf
-                $status = if ($hasImg -and $hasConfig) { "✅" } else { "⚠️ (incomplete)" }
-                Write-Host "$status $skinName"
+                if ($hasImg -and $hasConfig) {
+                    "✅ $name"
+                } else {
+                    "⚠️ (incomplete) $name"
+                }
+            }
+            if ($skins) {
+                $skins
+            } else {
+                Write-Host "No skins found in Sources/" -ForegroundColor Gray
             }
         }
 
         'up' {
-            if ($RemainingArgs.Count -ne 1) {
-                Write-Error "Usage: bcm up <skin_name>"
+            if ($Rest.Count -eq 0) {
+                Write-Host "❌ Usage: bcm up <skin>" -ForegroundColor Red
                 return
             }
-            $skinName = $RemainingArgs[0]
+            $skinName = $Rest[0]
             $skinPath = Join-Path $sourcesDir $skinName
-
             if (-not (Test-Path $skinPath -PathType Container)) {
-                Write-Error "Skin '$skinName' not found in $sourcesDir"
+                Write-Host "❌ Skin '$skinName' not found in Sources/" -ForegroundColor Red
                 return
             }
 
-            $imgSrc = Join-Path $skinPath "img"
-            $configSrc = Join-Path $skinPath "config.json"
+            $srcImg = Join-Path $skinPath "img"
+            $srcConfig = Join-Path $skinPath "config.json"
+            $dstImg = Join-Path $appDir "img"
+            $dstConfig = Join-Path $appDir "config.json"
 
-            if (-not (Test-Path $imgSrc -PathType Container)) {
-                Write-Error "Missing 'img' directory in skin: $skinPath"
+            if (-not (Test-Path $srcImg -PathType Container)) {
+                Write-Host "❌ Missing 'img' folder in skin: $skinName" -ForegroundColor Red
                 return
             }
-            if (-not (Test-Path $configSrc -PathType Leaf)) {
-                Write-Error "Missing 'config.json' in skin: $skinPath"
+            if (-not (Test-Path $srcConfig -PathType Leaf)) {
+                Write-Host "❌ Missing 'config.json' in skin: $skinName" -ForegroundColor Red
                 return
             }
 
-            $imgTarget = Join-Path $appDir "img"
-            $configTarget = Join-Path $appDir "config.json"
+            # Clean up existing
+            if (Test-Path $dstImg) { Remove-Item $dstImg -Recurse -Force }
+            if (Test-Path $dstConfig) { Remove-Item $dstConfig -Force }
 
-            # 清理可能的旧状态
-            if (Test-Path $imgTarget) { Remove-Item $imgTarget -Recurse -Force }
-            if (Test-Path $configTarget) { Remove-Item $configTarget -Force }
-
+            # Create links
             try {
-                cmd /c mklink /J "$imgTarget" "$imgSrc" 2>$null | Out-Null
-                New-Item -ItemType SymbolicLink -Path $configTarget -Target $configSrc -ErrorAction Stop | Out-Null
-
-                $skinRecordFile = Join-Path $appDir ".bcm-skin"
-                Set-Content -Path $skinRecordFile -Value $skinName -NoNewline
-
-                Write-Host "✅ Skin '$skinName' activated!" -ForegroundColor Green
+                cmd /c mklink /j "$dstImg" "$srcImg" *>$null
+                New-Item -ItemType SymbolicLink -Path $dstConfig -Target $srcConfig *>$null
+                Set-Content $recordFile $skinName
+                Write-Host "✅ Activated skin: $skinName" -ForegroundColor Green
             } catch {
-                Write-Error "Failed to create links. Run as Admin or enable Developer Mode.`nError: $_"
-                return
+                Write-Host "❌ Failed to create links. Run as Administrator or enable Developer Mode." -ForegroundColor Red
             }
         }
 
         'down' {
-            $current = Get-CurrentSkin
-            Remove-CurrentSkin
-            if ($current) {
-                Write-Host "🗑️  Skin '$current' deactivated." -ForegroundColor Yellow
-            } else {
-                Write-Host "ℹ️  No active skin to deactivate." -ForegroundColor Gray
-            }
+            $dstImg = Join-Path $appDir "img"
+            $dstConfig = Join-Path $appDir "config.json"
+            if (Test-Path $dstImg) { Remove-Item $dstImg -Recurse -Force }
+            if (Test-Path $dstConfig) { Remove-Item $dstConfig -Force }
+            if (Test-Path $recordFile) { Remove-Item $recordFile -Force }
+            Write-Host "✅ Deactivated current skin." -ForegroundColor Green
         }
 
         'switch' {
-            if ($RemainingArgs.Count -ne 1) {
-                Write-Error "Usage: bcm switch <skin_name>"
+            if ($Rest.Count -eq 0) {
+                Write-Host "❌ Usage: bcm switch <skin>" -ForegroundColor Red
                 return
             }
-            $newSkin = $RemainingArgs[0]
-
-            # 先停用当前（静默）
-            Remove-CurrentSkin
-
-            # 再激活新皮肤（复用 up 逻辑）
-            $skinPath = Join-Path $sourcesDir $newSkin
-            if (-not (Test-Path $skinPath -PathType Container)) {
-                Write-Error "Skin '$newSkin' not found in $sourcesDir"
-                return
-            }
-            $imgSrc = Join-Path $skinPath "img"
-            $configSrc = Join-Path $skinPath "config.json"
-            if (-not (Test-Path $imgSrc -PathType Container) -or -not (Test-Path $configSrc -PathType Leaf)) {
-                Write-Error "Skin '$newSkin' is incomplete."
-                return
-            }
-
-            $imgTarget = Join-Path $appDir "img"
-            $configTarget = Join-Path $appDir "config.json"
-            if (Test-Path $imgTarget) { Remove-Item $imgTarget -Recurse -Force }
-            if (Test-Path $configTarget) { Remove-Item $configTarget -Force }
-
-            try {
-                cmd /c mklink /J "$imgTarget" "$imgSrc" 2>$null | Out-Null
-                New-Item -ItemType SymbolicLink -Path $configTarget -Target $configSrc -ErrorAction Stop | Out-Null
-                Set-Content -Path (Join-Path $appDir ".bcm-skin") -Value $newSkin -NoNewline
-                Write-Host "🔄 Switched to skin: $newSkin" -ForegroundColor Magenta
-            } catch {
-                Write-Error "Switch failed: $_"
-                return
-            }
+            & $MyInvocation.MyCommand.ScriptBlock -Command 'down' @{}
+            & $MyInvocation.MyCommand.ScriptBlock -Command 'up' -Rest $Rest
         }
 
         'show' {
             $current = Get-CurrentSkin
             if ($current) {
-                Write-Host "Current skin: $current" -ForegroundColor Cyan
+                $current
             } else {
-                $recovered = Get-SkinFromLinks
-                if ($recovered) {
-                    Write-Host "Current skin (recovered): $recovered" -ForegroundColor Yellow
-                    Set-Content -Path (Join-Path $appDir ".bcm-skin") -Value $recovered -NoNewline
+                Write-Host "<none>" -ForegroundColor Gray
+            }
+        }
+
+        'run' {
+            $launchScript = Join-Path $appDir "launch.ps1"
+            if (-not (Test-Path $launchScript -PathType Leaf)) {
+                Write-Host "❌ Launch script not found: launch.ps1" -ForegroundColor Red
+                return
+            }
+
+            $imgPath    = Join-Path $appDir "img"
+            $configPath = Join-Path $appDir "config.json"
+
+            if (-not (Test-Path $imgPath -PathType Container) -or -not (Test-Path $configPath -PathType Leaf)) {
+                Write-Host "⚠️  No skin configured. Please run 'bcm up <skin>' first." -ForegroundColor Yellow
+                return
+            }
+
+            $current = Get-CurrentSkin
+            if ($current) {
+                Write-Host "🚀 Launching with skin: $current" -ForegroundColor Green
+            } else {
+                Write-Host "🚀 Launching..." -ForegroundColor Green
+            }
+
+            & $launchScript
+        }
+
+        'stop' {
+            $pidFile = Join-Path $appDir ".bcm-pid"
+
+            if (-not (Test-Path $pidFile -PathType Leaf)) {
+                Write-Host "ℹ️  .bcm-pid file not found. BongoCat Mver may not be running via 'bcm run'." -ForegroundColor Yellow
+                return
+            }
+
+            $pidContent = (Get-Content $pidFile -Raw).Trim()
+
+            # 校验 PID 格式
+            if ($pidContent -notmatch '^\d+$') {
+                Write-Host "❌ Invalid content in .bcm-pid: '$pidContent' (expected a number)" -ForegroundColor Red
+                return
+            }
+
+            $targetPid = [int]$pidContent
+
+            # 尝试获取进程
+            $process = $null
+            try {
+                $process = Get-Process -Id $targetPid -ErrorAction Stop
+            } catch {
+                if ($_.Exception.Message -like "*not found*") {
+                    Write-Host "✅ Process with PID ${targetPid} has already exited." -ForegroundColor Green
+                    return
                 } else {
-                    Write-Host "No active skin." -ForegroundColor Red
+                    Write-Host "⚠️  Failed to query process PID ${targetPid}: $_" -ForegroundColor Yellow
+                    return
                 }
             }
-        }
 
-    'run' {
-        $launchScript = Join-Path $appDir "launch.ps1"
-        if (-not (Test-Path $launchScript -PathType Leaf)) {
-            Write-Host "❌ Launch script not found: launch.ps1" -ForegroundColor Red
-            return
-        }
+            # 验证进程名（标准化比较）
+            $expectedName = "bongo cat mver"
+            $actualName = $process.ProcessName.ToLower().Replace(' ', '')
+            $expectedNorm = $expectedName.Replace(' ', '')
 
-        $imgPath    = Join-Path $appDir "img"
-        $configPath = Join-Path $appDir "config.json"
+            if ($actualName -ne $expectedNorm) {
+                Write-Host "⚠️  PID ${targetPid} belongs to '$($process.ProcessName)', not 'Bongo Cat Mver'." -ForegroundColor Yellow
+                Write-Host "💡 Skipping termination for safety." -ForegroundColor DarkGray
+                return
+            }
 
-        # 检查皮肤是否已激活（通过文件存在性判断）
-        if (-not (Test-Path $imgPath -PathType Container) -or -not (Test-Path $configPath -PathType Leaf)) {
-            Write-Host "⚠️  No skin configured. Please run 'bcm up <skin>' first." -ForegroundColor Yellow
-            return
-        }
-
-        # 可选：显示当前皮肤（如果能获取到）
-        $current = Get-CurrentSkin
-        if ($current) {
-            Write-Host "🚀 Launching with skin: $current" -ForegroundColor Green
-        } else {
-            Write-Host "🚀 Launching..." -ForegroundColor Green
-        }
-
-        & $launchScript
-    }
-    'status' {
-        $recordFile   = Join-Path $appDir ".bcm-skin"
-        $imgPath      = Join-Path $appDir "img"
-        $configPath   = Join-Path $appDir "config.json"
-
-        # 获取记录中的皮肤名
-        $recordedSkin = $null
-        if (Test-Path $recordFile) {
-            $recordedSkin = Get-Content $recordFile -Raw
-        }
-
-        # 检查 img 状态
-        $imgExists = Test-Path $imgPath -PathType Container
-        $imgIsLink = $false
-        if ($imgExists) {
-            $imgItem = Get-Item $imgPath -ErrorAction SilentlyContinue
-            if ($imgItem -and ($imgItem.LinkType -eq "Junction" -or $imgItem.LinkType -eq "SymbolicLink")) {
-                $imgIsLink = $true
+            # 终止进程
+            try {
+                Stop-Process -Id $targetPid -Force
+                Write-Host "🛑 Successfully stopped Bongo Cat Mver (PID: ${targetPid})" -ForegroundColor Green
+            } catch {
+                Write-Host "❌ Failed to stop process (PID: ${targetPid}): $_" -ForegroundColor Red
+                Write-Host "💡 You may need to run as Administrator or close it manually." -ForegroundColor DarkGray
             }
         }
 
-        # 检查 config.json 状态
-        $configExists = Test-Path $configPath -PathType Leaf
-        $configIsLink = $false
-        if ($configExists) {
-            $configItem = Get-Item $configPath -ErrorAction SilentlyContinue
-            if ($configItem -and $configItem.LinkType -eq "SymbolicLink") {
-                $configIsLink = $true
+        'check' {
+            $imgPath      = Join-Path $appDir "img"
+            $configPath   = Join-Path $appDir "config.json"
+
+            $recordedSkin = Get-CurrentSkin
+            $recoveredSkin = Get-SkinFromLinks
+            $activeSkin = if ($recordedSkin) { $recordedSkin } else { $recoveredSkin }
+
+            $imgExists = Test-Path $imgPath -PathType Container
+            $configExists = Test-Path $configPath -PathType Leaf
+
+            if (-not $imgExists -and -not $configExists) {
+                Write-Host "⚠️  No active skin." -ForegroundColor Yellow
+                Write-Host "💡 Run 'bcm up <skin>' to activate one." -ForegroundColor DarkGray
+                return
             }
-        }
 
-        # 尝试从链接反推皮肤名（用于验证）
-        $recoveredSkin = Get-SkinFromLinks
-
-        # 判断实际激活的皮肤（优先用记录，其次恢复）
-        $activeSkin = $recordedSkin
-        if (-not $activeSkin) { $activeSkin = $recoveredSkin }
-
-        # 验证皮肤是否在 Sources 中存在
-        $skinValid = $false
-        if ($activeSkin) {
-            $skinValid = Test-Path (Join-Path $sourcesDir $activeSkin) -PathType Container
-        }
-
-        # === 输出状态 ===
-        if (-not $imgExists -and -not $configExists) {
-            Write-Host "⚠️  No active skin." -ForegroundColor Yellow
-            Write-Host "💡 Run 'bcm up <skin>' to activate one." -ForegroundColor DarkGray
-            return
-        }
-
-        # 显示皮肤名
-        if ($activeSkin) {
-            Write-Host "Current skin: $activeSkin" -ForegroundColor Cyan
-            if (-not $skinValid) {
-                Write-Host "❌ Skin not found in Sources/ (orphaned)" -ForegroundColor Red
-            }
-        } else {
-            Write-Host "Current skin: unknown" -ForegroundColor Gray
-        }
-
-        # img 状态
-        if ($imgExists) {
-            if ($imgIsLink) {
-                Write-Host "✅ img → valid junction/symlink" -ForegroundColor Green
+            if ($activeSkin) {
+                $skinValid = Test-Path (Join-Path $sourcesDir $activeSkin) -PathType Container
+                Write-Host "Current skin: $activeSkin" -ForegroundColor Cyan
+                if (-not $skinValid) {
+                    Write-Host "❌ Skin not found in Sources/ (orphaned)" -ForegroundColor Red
+                }
             } else {
-                Write-Host "⚠️  img → exists but is a regular folder (not link)" -ForegroundColor Yellow
+                Write-Host "Current skin: unknown" -ForegroundColor Gray
             }
-        } else {
-            Write-Host "❌ img → missing" -ForegroundColor Red
-        }
 
-        # config.json 状态
-        if ($configExists) {
-            if ($configIsLink) {
-                Write-Host "✅ config.json → valid symlink" -ForegroundColor Green
+            # img
+            if ($imgExists) {
+                $item = Get-Item $imgPath -ErrorAction SilentlyContinue
+                if ($item -and ($item.LinkType -eq "Junction" -or $item.LinkType -eq "SymbolicLink")) {
+                    Write-Host "✅ img → valid junction/symlink" -ForegroundColor Green
+                } else {
+                    Write-Host "⚠️  img → exists but is a regular folder (not link)" -ForegroundColor Yellow
+                }
             } else {
-                Write-Host "⚠️  config.json → exists but is a regular file (not link)" -ForegroundColor Yellow
+                Write-Host "❌ img → missing" -ForegroundColor Red
             }
-        } else {
-            Write-Host "❌ config.json → missing" -ForegroundColor Red
+
+            # config.json
+            if ($configExists) {
+                $item = Get-Item $configPath -ErrorAction SilentlyContinue
+                if ($item -and $item.LinkType -eq "SymbolicLink") {
+                    Write-Host "✅ config.json → valid symlink" -ForegroundColor Green
+                } else {
+                    Write-Host "⚠️  config.json → exists but is a regular file (not link)" -ForegroundColor Yellow
+                }
+            } else {
+                Write-Host "❌ config.json → missing" -ForegroundColor Red
+            }
+
+            # Health summary
+            $imgOk = $imgExists -and (Get-Item $imgPath -ErrorAction SilentlyContinue).LinkType -ne $null
+            $configOk = $configExists -and (Get-Item $configPath -ErrorAction SilentlyContinue).LinkType -eq "SymbolicLink"
+            $skinValid = if ($activeSkin) { Test-Path (Join-Path $sourcesDir $activeSkin) } else { $false }
+
+            if ($imgOk -and $configOk -and $skinValid) {
+                Write-Host "✨ Skin is fully healthy." -ForegroundColor Green
+            } elseif ($imgExists -and $configExists) {
+                Write-Host "🔧 Skin files exist, but links may be broken. Consider reactivating." -ForegroundColor DarkYellow
+                Write-Host "💡 Run 'bcm down' then 'bcm up $activeSkin' to repair." -ForegroundColor DarkGray
+            } else {
+                Write-Host "💥 Skin is broken. Activation required." -ForegroundColor Red
+                Write-Host "💡 Run 'bcm up <skin>' to fix." -ForegroundColor DarkGray
+            }
         }
 
-        # 整体健康判断
-        $linksOk = $imgIsLink -and $configIsLink
-        $filesOk = $imgExists -and $configExists
-        if ($linksOk -and $skinValid) {
-            Write-Host "✨ Skin is fully healthy." -ForegroundColor Green
-        } elseif ($filesOk) {
-            Write-Host "🔧 Skin files exist, but links may be broken. Consider reactivating." -ForegroundColor DarkYellow
-            Write-Host "💡 Run 'bcm down' then 'bcm up $activeSkin' to repair." -ForegroundColor DarkGray
-        } else {
-            Write-Host "💥 Skin is broken. Activation required." -ForegroundColor Red
-            Write-Host "💡 Run 'bcm up <skin>' to fix." -ForegroundColor DarkGray
-        }
-    }
-    'doctor' {
-        Write-Host "🔍 BongoCat Mver Environment Check" -ForegroundColor Cyan
+        'doctor' {
+            Write-Host "🔍 BongoCat Mver Environment Check" -ForegroundColor Cyan
 
-        # 1. 检查 $env:bcm_home
-        if (-not $env:bcm_home) {
-            Write-Host "❌ `$env:bcm_home is not set" -ForegroundColor Red
-            Write-Host "💡 Set it to your BongoCatMver root (e.g., 'E:\BongoCatMver')" -ForegroundColor DarkGray
-            return
-        }
-        Write-Host "✅ `$env:bcm_home = $env:bcm_home"
+            Write-Host "✅ `$env:bcm_home = $env:bcm_home"
 
-        # 2. 检查根目录结构
-        $root = Resolve-Path $env:bcm_home -ErrorAction SilentlyContinue
-        if (-not $root -or -not (Test-Path $root)) {
-            Write-Host "❌ Root path invalid: $env:bcm_home" -ForegroundColor Red
-            return
-        }
+            if (-not (Test-Path $appDir -PathType Container)) {
+                Write-Host "❌ Missing application directory: $appDir" -ForegroundColor Red
+                return
+            }
+            Write-Host "✅ Application directory: $appDir"
 
-        # 3. 检查 BongoCatMver/ 目录
-        $appDir = Join-Path $root "BongoCatMver"
-        if (-not (Test-Path $appDir -PathType Container)) {
-            Write-Host "❌ Missing application directory: $appDir" -ForegroundColor Red
-            return
-        }
-        Write-Host "✅ Application directory: $appDir"
+            if (-not (Test-Path $sourcesDir -PathType Container)) {
+                Write-Host "❌ Missing Sources directory: $sourcesDir" -ForegroundColor Red
+                Write-Host "💡 Create it and place skins inside." -ForegroundColor DarkGray
+                return
+            }
+            Write-Host "✅ Sources directory: $sourcesDir"
 
-        # 4. 检查 Sources/ 目录
-        $sourcesDir = Join-Path $root "Sources"
-        if (-not (Test-Path $sourcesDir -PathType Container)) {
-            Write-Host "❌ Missing Sources directory: $sourcesDir" -ForegroundColor Red
-            Write-Host "💡 Create it and place skins inside." -ForegroundColor DarkGray
-            return
-        }
-        Write-Host "✅ Sources directory: $sourcesDir"
+            $launchScript = Join-Path $appDir "launch.ps1"
+            if (Test-Path $launchScript -PathType Leaf) {
+                Write-Host "✅ Launch script: present"
+            } else {
+                Write-Host "⚠️  launch.ps1 not found" -ForegroundColor Yellow
+            }
 
-        # 5. 检查 launch.ps1
-        $launchScript = Join-Path $appDir "launch.ps1"
-        if (-not (Test-Path $launchScript -PathType Leaf)) {
-            Write-Host "⚠️  launch.ps1 not found (required to run BongoCat)" -ForegroundColor Yellow
-        } else {
-            Write-Host "✅ Launch script: present"
+            $validSkins = Get-ChildItem $sourcesDir -Directory | Where-Object {
+                (Test-Path (Join-Path $_.FullName "img") -PathType Container) -and
+                (Test-Path (Join-Path $_.FullName "config.json") -PathType Leaf)
+            }
+            if ($validSkins.Count -eq 0) {
+                Write-Host "⚠️  No valid skins found in Sources/" -ForegroundColor Yellow
+                Write-Host "💡 A valid skin must contain 'img/' and 'config.json'" -ForegroundColor DarkGray
+            } else {
+                Write-Host "✅ Found $($validSkins.Count) valid skin(s) in Sources/"
+            }
+
+            $current = Get-CurrentSkin
+            if ($current) {
+                Write-Host "ℹ️  Current skin: $current"
+            }
+
+            Write-Host "`n✨ Environment check complete!" -ForegroundColor Green
         }
 
-        # 6. 检查至少一个有效皮肤
-        $validSkins = Get-ChildItem $sourcesDir -Directory | Where-Object {
-            (Test-Path (Join-Path $_.FullName "img") -PathType Container) -and
-            (Test-Path (Join-Path $_.FullName "config.json") -PathType Leaf)
-        }
-        if ($validSkins.Count -eq 0) {
-            Write-Host "⚠️  No valid skins found in Sources/" -ForegroundColor Yellow
-            Write-Host "💡 A valid skin must contain 'img/' folder and 'config.json'" -ForegroundColor DarkGray
-        } else {
-            Write-Host "✅ Found $($validSkins.Count) valid skin(s) in Sources/"
+        'info' {
+            if ($Rest.Count -eq 0) {
+                Write-Host "❌ Usage: bcm info <skin>" -ForegroundColor Red
+                return
+            }
+
+            $skinName = $Rest[0]
+            $skinPath = Join-Path $sourcesDir $skinName
+
+            if (-not (Test-Path $skinPath -PathType Container)) {
+                Write-Host "❌ Skin '$skinName' not found in Sources/" -ForegroundColor Red
+                return
+            }
+
+            $infoFile = Join-Path $skinPath "skin.json"
+
+            if (-not (Test-Path $infoFile -PathType Leaf)) {
+                Write-Host "❌ Skin '$skinName' has no skin.json metadata file." -ForegroundColor Yellow
+                Write-Host "💡 Authors can add it to provide info like name, author, and license." -ForegroundColor DarkGray
+                return
+            }
+
+            try {
+                $meta = Get-Content $infoFile -Raw | ConvertFrom-Json
+            } catch {
+                Write-Host "⚠️  skin.json exists but is not valid JSON." -ForegroundColor Yellow
+                return
+            }
+
+            $name       = if ($meta.PSObject.Properties.Name -contains 'name')       { $meta.name }       else { $skinName }
+            $author     = if ($meta.PSObject.Properties.Name -contains 'author')     { $meta.author }     else { "<unknown>" }
+            $version    = if ($meta.PSObject.Properties.Name -contains 'version')    { $meta.version }    else { "<unknown>" }
+            $license    = if ($meta.PSObject.Properties.Name -contains 'license')    { $meta.license }    else { "<not specified>" }
+            $compatible = if ($meta.PSObject.Properties.Name -contains 'bongocatMver'){ $meta.bongocatMver} else { "<not specified>" }
+            $homepage   = if ($meta.PSObject.Properties.Name -contains 'homepage')   { $meta.homepage }   else { $null }
+            $desc       = if ($meta.PSObject.Properties.Name -contains 'description'){ $meta.description }else { $null }
+
+            Write-Host "Name:       $name" -ForegroundColor Cyan
+            Write-Host "Author:     $author" -ForegroundColor Green
+            Write-Host "Version:    $version" -ForegroundColor Gray
+            Write-Host "License:    $license" -ForegroundColor Magenta
+            Write-Host "Compatible: BongoCat Mver $compatible" -ForegroundColor Gray
+
+            if ($homepage) {
+                Write-Host "Homepage:   $homepage" -ForegroundColor Cyan
+            }
+
+            if ($desc) {
+                Write-Host "Description:" -ForegroundColor Gray
+                ($desc -split '\n') | ForEach-Object { Write-Host "  $_" }
+            }
         }
 
-        # 7. 检查当前皮肤状态（复用 status 逻辑简化版）
-        $current = Get-CurrentSkin
-        if ($current) {
-            Write-Host "ℹ️  Current skin: $current"
+        'preview' {
+            if ($Rest.Count -eq 0) {
+                Write-Host "❌ Usage: bcm preview <skin>" -ForegroundColor Red
+                return
+            }
+
+            $skinName = $Rest[0]
+            $skinPath = Join-Path $sourcesDir $skinName
+
+            if (-not (Test-Path $skinPath -PathType Container)) {
+                Write-Host "❌ Skin '$skinName' not found in Sources/" -ForegroundColor Red
+                return
+            }
+
+            # 查找预览图（按优先级）
+            $previewExtensions = @('.png', '.jpg', '.jpeg', '.gif')
+            $previewFile = $null
+            foreach ($ext in $previewExtensions) {
+                $candidate = Join-Path $skinPath ("preview" + $ext)
+                if (Test-Path $candidate -PathType Leaf) {
+                    $previewFile = $candidate
+                    break
+                }
+            }
+
+            if (-not $previewFile) {
+                Write-Host "🖼️  No preview image found for skin '$skinName'." -ForegroundColor Yellow
+                Write-Host "💡 Expected: preview.png, preview.jpg, preview.gif, etc." -ForegroundColor DarkGray
+                return
+            }
+
+            # 检查预览命令
+            if (-not $env:bcm_previewcmd) {
+                Write-Host "⚠️  `$env:bcm_previewcmd is not set." -ForegroundColor Yellow
+                Write-Host "💡 Set it to your terminal's image display command, e.g.:" -ForegroundColor DarkGray
+                Write-Host "     `$env:bcm_previewcmd = 'kitty +kitten icat'" -ForegroundColor Cyan
+                Write-Host "     `$env:bcm_previewcmd = 'wezterm imgcat'" -ForegroundColor Cyan
+                Write-Host "     `$env:bcm_previewcmd = 'Invoke-Item'  # fallback to default viewer" -ForegroundColor Cyan
+                return
+            }
+
+            $fullPath = Resolve-Path $previewFile
+            $cmd = $env:bcm_previewcmd
+            $argsList = @($fullPath.Path)
+
+            try {
+                # 分割命令（支持带空格的命令，如 "kitty +kitten icat"）
+                if ($cmd -match '\s') {
+                    # 假设第一个词是程序，其余是参数
+                    $tokens = $cmd -split '\s+', 2
+                    $exe = $tokens[0]
+                    $extraArgs = if ($tokens.Count -gt 1) { $tokens[1] } else { "" }
+                    $allArgs = "$extraArgs $(($fullPath.Path | ConvertTo-Json -Compress))"
+                    # 更安全的方式：用 Start-Process 并传参
+                    $processArgs = @($extraArgs.Split(' ', [System.StringSplitOptions]::RemoveEmptyEntries))
+                    $processArgs += $fullPath.Path
+                    Start-Process -FilePath $exe -ArgumentList $processArgs -NoNewWindow
+                } else {
+                    # 简单命令，如 "start", "imgcat"
+                    & $cmd $fullPath.Path
+                }
+                Write-Host "👁️  Previewing: $($fullPath.Path)" -ForegroundColor Green
+            } catch {
+                Write-Host "❌ Failed to run preview command: $cmd" -ForegroundColor Red
+                Write-Host "Error: $_" -ForegroundColor DarkRed
+            }
         }
 
-        Write-Host "`n✨ Environment check complete!" -ForegroundColor Green
-    }
+        'build' {
+            $pidFile = Join-Path $appDir ".bcm-pid"
+            $windowFile = Join-Path $appDir ".bcm-window"
 
+            # (1) 检查 .bcm-pid 是否存在
+            if (-not (Test-Path $pidFile -PathType Leaf)) {
+                Write-Host "ℹ️  .bcm-pid file not found. BongoCat Mver may not be running via 'bcm run'." -ForegroundColor Yellow
+                return
+            }
+
+            # (2) 读取并校验 PID 格式
+            $pidContent = (Get-Content $pidFile -Raw).Trim()
+            if ($pidContent -notmatch '^\d+$') {
+                Write-Host "❌ Invalid content in .bcm-pid: '$pidContent' (expected a number)" -ForegroundColor Red
+                return
+            }
+
+            $targetPid = [int]$pidContent
+
+            # (3) 验证进程是否存在且名称正确
+            $process = $null
+            try {
+                $process = Get-Process -Id $targetPid -ErrorAction Stop
+            } catch {
+                Write-Host "❌ Process with PID ${targetPid} does not exist." -ForegroundColor Red
+                return
+            }
+
+            # 标准化进程名比较（处理空格和大小写）
+            $actualName = $process.ProcessName.ToLower().Replace(' ', '')
+            $expectedName = "bongocatmver"  # 注意：PowerShell 返回的 ProcessName 是 "Bongo Cat Mver" → 去空格后为 "bongocatmver"
+
+            if ($actualName -ne $expectedName) {
+                Write-Host "⚠️  PID ${targetPid} belongs to '$($process.ProcessName)', not 'Bongo Cat Mver'." -ForegroundColor Yellow
+                Write-Host "💡 Skipping .bcm-window update for safety." -ForegroundColor DarkGray
+                return
+            }
+
+            # (4) 获取窗口信息
+            Write-Host "🔍 Fetching window info for PID ${targetPid}..." -ForegroundColor Cyan
+            $winInfo = Get-BcmWindowInfo -ProcessId $targetPid
+
+            if ($null -eq $winInfo) {
+                Write-Host "❌ Failed to retrieve window information (window may be hidden or minimized)." -ForegroundColor Red
+                return
+            }
+
+            # (5) 构造配置对象并写入 .bcm-window
+            $config = [ordered]@{
+                x      = $winInfo.Left
+                y      = $winInfo.Top
+                width  = $winInfo.Width
+                height = $winInfo.Height
+            }
+
+            try {
+                $jsonContent = $config | ConvertTo-Json -Compress
+                Set-Content -Path $windowFile -Value $jsonContent -Encoding UTF8 -Force
+                Write-Host "✅ Successfully wrote window config to ${windowFile}:" -ForegroundColor Green
+                Write-Host "   Position: ($($winInfo.Left), $($winInfo.Top))" -ForegroundColor Gray
+                Write-Host "   Size: $($winInfo.Width)×$($winInfo.Height)" -ForegroundColor Gray
+            } catch {
+                Write-Host "❌ Failed to write ${windowFile}: $_" -ForegroundColor Red
+            }
+        }
+
+        'status' {
+            $pidFile = Join-Path $appDir ".bcm-pid"
+
+            if (-not (Test-Path $pidFile -PathType Leaf)) {
+                Write-Host "ℹ️  BongoCat Mver is not running (via 'bcm run')." -ForegroundColor Yellow
+                return
+            }
+
+            $pidContent = (Get-Content $pidFile -Raw).Trim()
+            if ($pidContent -notmatch '^\d+$') {
+                Write-Host "❌ Invalid content in .bcm-pid: '$pidContent' (expected a number)" -ForegroundColor Red
+                return
+            }
+
+            $targetPid = [int]$pidContent
+
+            $process = $null
+            try {
+                $process = Get-Process -Id $targetPid -ErrorAction Stop
+            } catch {
+                Write-Host "❌ Process with PID ${targetPid} does not exist." -ForegroundColor Red
+                return
+            }
+
+            $actualName = $process.ProcessName.ToLower().Replace(' ', '')
+            if ($actualName -ne "bongocatmver") {
+                Write-Host "⚠️  PID ${targetPid} belongs to '$($process.ProcessName)', not 'Bongo Cat Mver'." -ForegroundColor Yellow
+                Write-Host "💡 This may not be a bcm-managed instance." -ForegroundColor DarkGray
+                return
+            }
+
+            Write-Host "BongoCat Mver is running." -ForegroundColor Green
+            Write-Host "  PID:      ${targetPid}" -ForegroundColor Gray
+            Write-Host "  Memory:   $(($process.WorkingSet64 / 1MB).ToString("F1")) MB" -ForegroundColor Gray
+            Write-Host "  CPU Time: $($process.TotalProcessorTime.ToString('hh\:mm\:ss'))" -ForegroundColor Gray
+
+            $winInfo = Get-BcmWindowInfo -ProcessId $targetPid
+            if ($winInfo) {
+                Write-Host "  Position: ($($winInfo.Left), $($winInfo.Top))" -ForegroundColor Gray
+                Write-Host "  Size:     $($winInfo.Width)×$($winInfo.Height)" -ForegroundColor Gray
+            } else {
+                Write-Host "  Window:   Not found (may be hidden/minimized)" -ForegroundColor Yellow
+            }
+        }
+        'help' {
+            Write-Host @"
+BongoCat Mver Skin & Process Manager (bcm) - v1.0.0
+
+USAGE:
+  bcm <command> [args]
+
+SKIN MANAGEMENT:
+  list                List all available skins in Sources/
+  up <skin>           Activate a skin by creating symlinks
+  down                Deactivate current skin (remove links & record)
+  switch <skin>       Switch to another skin (down + up)
+  show                Show currently active skin name
+  check               Show detailed activation status and health check
+
+LAUNCH & PROCESS:
+  run                 Launch BongoCat Mver (requires active skin)
+  stop                Stop the running BongoCat Mver instance (via .bcm-pid)
+  status              Show runtime info: PID, memory, CPU, window position/size
+  build               Save current window geometry to .bcm-window (for launch)
+
+UTILITIES:
+  doctor              Diagnose environment setup issues
+  info <skin>         Show skin metadata from skin.json
+  preview <skin>      Preview skin using `$env:bcm_previewcmd
+  help                Show this help message
+  version             Show version info
+"@ -ForegroundColor Cyan
+        }
+
+        'version' {
+            Write-Host "BongoCat Mver Skin Manager (bcm) - v2.0.0"
+        }
     }
 }
