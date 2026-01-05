@@ -238,7 +238,7 @@ namespace WindowUtils {
                 Write-Host "🚀 Launching..." -ForegroundColor Green
             }
 
-            & $launchScript
+            sudo --inline pwsh -NoProfile -File  $launchScript
         }
 
         'stop' {
